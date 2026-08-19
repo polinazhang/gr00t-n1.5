@@ -345,7 +345,7 @@ def main(config: ArgsConfig):
     # 2.1 modify training args
     training_args = TrainingArguments(
         output_dir=config.output_dir,
-        run_name=None,
+        run_name=Path(config.output_dir).name,
         remove_unused_columns=False,
         deepspeed="",
         gradient_checkpointing=False,

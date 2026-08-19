@@ -188,7 +188,12 @@ def _read_video_decord(
     ele: dict,
 ) -> (torch.Tensor, float, list):
     """read video using decord.VideoReader and return also per-frame timestamps"""
-    import decord
+    # Import lazily so image-only and torchvision video paths do not require
+    # decord. Using import_module also prevents Transformers' remote-code
+    # dependency scanner from rejecting this processor before backend choice.
+    import importlib
+
+    decord = importlib.import_module("decord")
 
     video_path = ele["video"]
     st = time.time()
