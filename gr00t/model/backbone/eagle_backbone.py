@@ -112,6 +112,85 @@ class EagleBackbone(nn.Module):
         eagle_features = self.eagle_linear(eagle_features)
         return eagle_features, eagle_input["attention_mask"]
 
+    def extract_vision_embeddings(self, vl_input: BatchFeature) -> torch.Tensor:
+        """
+        Static-inference helper (additive; not used by forward/forward_eagle).
+
+        Returns h_v: the vision embeddings after the image encoder + projector
+        (vision tower + optional pixel shuffle + mlp1), i.e. the image-embedding
+        tokens in the LLM embedding space, before the language model. All camera
+        views concatenated, reshaped to (-1, C) exactly as the embedding scatter
+        in Eagle2_5_VL.forward consumes them. No image_flags are passed, matching
+        the real training/inference forward path.
+        """
+        eagle_prefix = "eagle_"
+        eagle_input = {
+            k.removeprefix(eagle_prefix): v
+            for k, v in vl_input.items()
+            if k.startswith(eagle_prefix)
+        }
+        vit_embeds = self.eagle_model.extract_feature(eagle_input["pixel_values"])
+        return vit_embeds.reshape(-1, vit_embeds.shape[-1])
+
+    def forward_with_vision_embeds(
+        self, vl_input: BatchFeature, vision_embeds: torch.Tensor
+    ) -> BatchFeature:
+        """
+        Static-inference helper (additive; not used by forward/forward_eagle).
+
+        Identical to forward(), except the provided `vision_embeds` are scattered
+        into the input embeddings in place of extract_feature(pixel_values)
+        output. This replicates the embedding-scatter + language-model path of
+        Eagle2_5_VL.forward exactly (no image_flags, same select_layer and
+        eagle_linear application), so gradients can flow into `vision_embeds`
+        (e.g. via an additive delta). Returns the same BatchFeature as forward().
+        """
+        self.set_frozen_modules_to_eval_mode()
+
+        eagle_prefix = "eagle_"
+        eagle_input = {
+            k.removeprefix(eagle_prefix): v
+            for k, v in vl_input.items()
+            if k.startswith(eagle_prefix)
+        }
+        del eagle_input["image_sizes"]
+        input_ids = eagle_input["input_ids"]
+        attention_mask = eagle_input["attention_mask"]
+
+        input_embeds = self.eagle_model.language_model.get_input_embeddings()(input_ids)
+
+        B, N, C = input_embeds.shape
+        input_embeds = input_embeds.reshape(B * N, C)
+
+        flat_input_ids = input_ids.reshape(B * N)
+        selected = flat_input_ids == self.eagle_model.image_token_index
+        try:
+            input_embeds[selected] = input_embeds[selected] * 0.0 + vision_embeds
+        except Exception as e:
+            print(
+                f"warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, "
+                f"vision_embeds.shape={vision_embeds.shape}"
+            )
+            n_token = selected.sum()
+            input_embeds[selected] = input_embeds[selected] * 0.0 + vision_embeds[:n_token]
+
+        input_embeds = input_embeds.reshape(B, N, C)
+
+        outputs = self.eagle_model.language_model(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=True,
+        )
+        eagle_features = outputs["hidden_states"][self.select_layer]
+        eagle_features = self.eagle_linear(eagle_features)
+        return BatchFeature(
+            data={"backbone_features": eagle_features, "backbone_attention_mask": attention_mask}
+        )  # [B, T2, hidden_size]
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 

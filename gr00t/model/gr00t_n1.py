@@ -196,6 +196,141 @@ class GR00T_N1_5(PreTrainedModel):
         action_inputs = tree.map_structure(to_device_with_maybe_dtype, action_inputs)
         return backbone_inputs, action_inputs
 
+    def static_inference(
+        self,
+        inputs: dict,
+        num_inference_steps: int | None = None,
+        compute_gradnorm: bool = True,
+    ) -> dict:
+        """
+        Static inference (analysis-only; additive method, not used by forward/get_action).
+
+        Given one demonstration frame (batch size 1, inputs must contain the padded
+        ground-truth `action` and `action_mask`, i.e. processed with the action
+        modality included), runs the standard 4-step flow-matching denoising loop
+        starting from a single noise tensor drawn exactly like get_action, and
+        compares the per-step velocity predictions against the ground-truth
+        target u = gt_action - noise.
+
+        Returns a dict of CPU tensors / floats:
+            - "u": [B, H, D] prediction target (gt_action - noise), float32 on CPU
+            - "v": list of num_steps tensors [B, H, D], velocity prediction per step
+            - "final_loss": list of num_steps floats, masked MSE(v_n, u) per step,
+              same semantics as the n1.5 training loss
+              (sum((v_n - u)^2 * mask) / mask.sum())
+            - "cosine": list of num_steps floats, cosine between v_n and u over the
+              valid (masked) elements only
+            - "gradnorm_vision": list of num_steps floats, ||grad_{h_v} L_n||_2 where
+              h_v is the vision embedding (image encoder + projector output, before
+              the language model); NaN if compute_gradnorm=False
+            - "action_mask": [B, H, D] mask on CPU
+        """
+        backbone_inputs, action_inputs = self.prepare_input(inputs)
+
+        assert "action" in action_inputs, "static_inference requires ground-truth actions"
+        assert "action_mask" in action_inputs, "static_inference requires action_mask"
+        gt_action = action_inputs.action  # [B, max_action_horizon, max_action_dim]
+        action_mask = action_inputs.action_mask
+        embodiment_id = action_inputs.embodiment_id
+
+        head = self.action_head
+        num_steps = (
+            num_inference_steps
+            if num_inference_steps is not None
+            else head.num_inference_timesteps
+        )
+        dt = 1.0 / num_steps
+
+        # ---- Pass 1: standard denoising loop under no_grad ----
+        with torch.no_grad():
+            backbone_outputs = self.backbone(backbone_inputs)
+            # process_backbone_output mutates the dict in place; this dict is fresh
+            # from the backbone call above, so this is safe.
+            backbone_outputs = head.process_backbone_output(backbone_outputs)
+            vl_embs = backbone_outputs.backbone_features
+            state_features = head.state_encoder(action_inputs.state, embodiment_id)
+
+            # Generate noise ONCE, exactly like get_action, and reuse the same
+            # tensor as the t=0 latent for all steps and computations.
+            batch_size = vl_embs.shape[0]
+            noise = torch.randn(
+                size=(batch_size, head.config.action_horizon, head.config.action_dim),
+                dtype=vl_embs.dtype,
+                device=vl_embs.device,
+            )
+
+            u = gt_action - noise
+            latents = noise.clone()
+
+            v_list = []
+            latent_list = []
+            final_loss_list = []
+            cosine_list = []
+            for n in range(num_steps):
+                v_n = head.static_denoise_step(
+                    backbone_outputs, state_features, latents, n, embodiment_id
+                )
+                latent_list.append(latents.clone())
+                final_loss_list.append(float(self._static_masked_mse(v_n, u, action_mask)))
+                # Cosine between v_n and u over valid (masked) elements only,
+                # pooling all valid elements into one inner product. gr00t
+                # predicts v = A* - eps and our stored u = A* - eps, so
+                # cos(v_n, u) is +1 for a perfect prediction.
+                v_masked = v_n * action_mask
+                u_masked = u * action_mask
+                cosine_n = (v_masked * u_masked).sum() / (
+                    v_masked.norm() * u_masked.norm() + 1e-6
+                )
+                v_list.append(v_n.detach())
+                cosine_list.append(float(cosine_n))
+                latents = latents + dt * v_n
+
+        # ---- Pass 2: vision grad norm per step (grad through h_v) ----
+        if compute_gradnorm:
+            # h_v computed under no_grad and detached; the gradient target is the
+            # additive delta, which equals dL/dh_v at delta=0.
+            with torch.no_grad():
+                h_v = self.backbone.extract_vision_embeddings(backbone_inputs)
+            h_v = h_v.detach()
+
+            gradnorm_list = []
+            for n in range(num_steps):
+                delta = torch.zeros_like(h_v).requires_grad_(True)
+                backbone_outputs_n = self.backbone.forward_with_vision_embeds(
+                    backbone_inputs, h_v + delta
+                )
+                backbone_outputs_n = head.process_backbone_output(backbone_outputs_n)
+                state_features_n = head.state_encoder(action_inputs.state, embodiment_id)
+                v_n = head.static_denoise_step(
+                    backbone_outputs_n, state_features_n, latent_list[n], n, embodiment_id
+                )
+                loss_n = self._static_masked_mse(v_n, u, action_mask)
+                g = torch.autograd.grad(loss_n, delta)[0]
+                gradnorm_list.append(float(g.float().norm(p=2)))
+        else:
+            gradnorm_list = [float("nan")] * num_steps
+
+        return {
+            "u": u.detach().float().cpu(),
+            "v": [v.float().cpu() for v in v_list],
+            "final_loss": final_loss_list,
+            "cosine": cosine_list,
+            "gradnorm_vision": gradnorm_list,
+            "action_mask": action_mask.detach().cpu(),
+        }
+
+    @staticmethod
+    def _static_masked_mse(v: torch.Tensor, u: torch.Tensor, action_mask: torch.Tensor) -> torch.Tensor:
+        """Masked MSE with the exact n1.5 training-loss semantics:
+        sum((v - u)^2 * mask) / mask.sum() (FlowmatchingActionHead.forward).
+        The +1e-6 epsilon used in the n1.6 static-inference code is dropped to
+        match n1.5 exactly; a zero mask is asserted against instead (an empty
+        mask would indicate a data/config bug, and NaN would silently poison
+        every downstream statistic)."""
+        mask_sum = action_mask.sum()
+        assert mask_sum > 0, "action_mask has no valid elements"
+        return ((v - u) ** 2 * action_mask).sum() / mask_sum
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
         tune_visual = kwargs.pop("tune_visual", True)

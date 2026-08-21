@@ -404,6 +404,58 @@ class FlowmatchingActionHead(nn.Module):
             actions = actions + dt * pred_velocity
         return BatchFeature(data={"action_pred": actions})
 
+    def static_denoise_step(
+        self,
+        backbone_output: BatchFeature,
+        state_features: torch.Tensor,
+        actions: torch.Tensor,
+        step_idx: int,
+        embodiment_id: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Static-inference helper (additive; not used by forward/get_action).
+
+        One iteration of the get_action denoising loop body: given the current
+        latent `actions` at inference step `step_idx`, returns the predicted
+        velocity. Mirrors get_action exactly (future_tokens included, no
+        encoder_attention_mask passed to the DiT). NOT decorated with no_grad,
+        so gradients can flow through the backbone features when called outside
+        a no_grad context.
+        """
+        vl_embs = backbone_output.backbone_features
+        batch_size = vl_embs.shape[0]
+        device = vl_embs.device
+
+        num_steps = self.num_inference_timesteps
+        t_cont = step_idx / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
+        t_discretized = int(t_cont * self.num_timestep_buckets)
+
+        # Embed noised action trajectory.
+        timesteps_tensor = torch.full(
+            size=(batch_size,), fill_value=t_discretized, device=device
+        )
+        action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+        # Maybe add position embedding.
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            action_features = action_features + pos_embs
+
+        # Join vision, language, state and action embedding along sequence dimension.
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+
+        # Run model forward (same call signature as get_action: no encoder_attention_mask).
+        model_output = self.model(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_embs,
+            timestep=timesteps_tensor,
+        )
+        pred = self.action_decoder(model_output, embodiment_id)
+
+        pred_velocity = pred[:, -self.action_horizon :]
+        return pred_velocity
+
     @property
     def device(self):
         return next(iter(self.parameters())).device
