@@ -58,8 +58,14 @@ ACTION_HORIZON = 16  # real action horizon (robocasa action delta indices 0..15)
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--task_id", type=int, required=True, help="Task id, 1..18")
+    parser.add_argument("--task_id", type=int, default=None, help="Task id, 1..18 (not needed with --dataset_dir)")
     parser.add_argument("--dataset_root", type=str, default=str(DEFAULT_DATASET_ROOT))
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default=None,
+        help="Direct LeRobot task dir; overrides dataset_root/task_{task_id}_demo_50",
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -114,8 +120,11 @@ def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    assert 1 <= args.task_id <= 18, f"task_id must be in 1..18, got {args.task_id}"
-    dataset_path = Path(args.dataset_root) / f"task_{args.task_id}_demo_50"
+    if args.dataset_dir is None:
+        assert args.task_id is not None and 1 <= args.task_id <= 18, f"task_id must be in 1..18, got {args.task_id}"
+        dataset_path = Path(args.dataset_root) / f"task_{args.task_id}_demo_50"
+    else:
+        dataset_path = Path(args.dataset_dir)
     assert dataset_path.is_dir(), f"Dataset not found: {dataset_path}"
 
     assert Path(args.checkpoint).is_dir(), (
@@ -125,7 +134,11 @@ def main():
     logging.info(f"Checkpoint: {args.checkpoint}")
 
     timestamp = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
-    task_output_dir = Path(args.output_root) / timestamp / f"task_{args.task_id}"
+    if args.dataset_dir is not None and args.task_id is None:
+        # --dataset_dir mode: output_root/timestamp already identifies the task.
+        task_output_dir = Path(args.output_root) / timestamp
+    else:
+        task_output_dir = Path(args.output_root) / timestamp / f"task_{args.task_id}"
     task_output_dir.mkdir(parents=True, exist_ok=True)
     logging.info(f"Output dir: {task_output_dir}")
 
