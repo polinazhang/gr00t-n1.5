@@ -78,6 +78,8 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max_episodes", type=int, default=None, help="Debug: cap number of episodes")
     parser.add_argument("--max_frames", type=int, default=None, help="Debug: cap frames per episode")
+    parser.add_argument("--num_steps", type=int, default=NUM_DENOISE_STEPS,
+                        help="Number of denoising steps to compute (default: 4)")
     parser.add_argument("--timestamp", type=str, default=None, help="Override output timestamp dir name")
     parser.add_argument("--no_gradnorm", action="store_true", help="Skip vision grad norm computation")
     return parser.parse_args()
@@ -119,6 +121,8 @@ def build_frame_inputs(transform, groot_tf, data_point):
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    NUM_DENOISE_STEPS = args.num_steps  # CLI override; shadows the module-level default (4)
 
     if args.dataset_dir is None:
         assert args.task_id is not None and 1 <= args.task_id <= 18, f"task_id must be in 1..18, got {args.task_id}"
@@ -197,7 +201,7 @@ def main():
             data_point = dataset.get_step_data(traj_id, t)
             collated = build_frame_inputs(transform, groot_tf, data_point)
             result = policy.model.static_inference(
-                collated, compute_gradnorm=not args.no_gradnorm
+                collated, num_inference_steps=args.num_steps, compute_gradnorm=not args.no_gradnorm
             )
 
             # Derive real action dims from the mask (horizon 16 x dim 12 for robocasa).
